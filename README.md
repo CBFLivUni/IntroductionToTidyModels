@@ -4,4 +4,5 @@ This repository contains the quarto notebooks used for the [NorthernBug 9, Liver
 The rendered quarto notebooks (html) can be viewed within a browser or here:
 
 [01_IntroductionToTidyModelBasics](https://pgb.liv.ac.uk/~jsoul/01_IntroductionToTidyModelBasics)
+
 [02_PredictingTheAgeOfBats](https://pgb.liv.ac.uk/~jsoul/02_PredictingTheAgeOfBats)
