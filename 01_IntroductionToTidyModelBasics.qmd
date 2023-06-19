@@ -1,0 +1,307 @@
+---
+title: "Introduction to machine learning with tidymodels"
+subtitle: The basics
+author: Dr Jamie Soul
+format: html
+editor: visual
+title-block-banner: true
+toc: true
+self-contained: true
+bibliography: references.bib
+---
+
+![](imgs/CBF.png){fig-align="center"}
+
+## Loading the metapackage
+
+The tidymodels packages loads a set of modular packages that we will use to build a machine learning workflow - from preparing the data to assessing the performance.
+
+![](imgs/tidymodelsBadge.png){fig-align="center"}
+
+```{r}
+library(tidymodels)
+```
+
+## Example small classification problem
+
+Let's cover the basic principles with an example medical dataset looking to see if we can predict patients who have stroke from life style variables.
+
+::: callout-note
+Exploratory data analysis is a critical step is any data science project.
+:::
+
+Here we use the `skimr` package to get an overview of the dataframe which quickly highlight the BMI column has missing values.
+
+```{r}
+#| message: false 
+#load the needed libraries
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(MLDataR)
+
+#explicitly call the built in data
+#warning - this dataset is only chosen for illustration purposes
+#see bmi,smoking status versus age
+data("stroke_classification")
+
+#janitor is useful to make the column names tidy
+stroke_classification <- clean_names(stroke_classification)
+stroke_classification <- stroke_classification[ stroke_classification$gender %in% c("Male","Female"),]
+
+#make the primary outcome a factor
+stroke_classification$stroke <- as.factor(stroke_classification$stroke)
+
+#Good idea to take a look at the data!
+skim(stroke_classification)
+```
+
+## Split into test and training
+
+![](imgs/rsampleBadge.png){fig-align="center"}
+
+We want the model to generalise to new unseen data, so we split our dataset into a training and test dataset. We'll fit the model on the training data then evaluate the performance on the unseen test data
+
+```{r}
+#Need to set the seed to be reproducible
+set.seed(42)
+
+#save 25% of the data for testing the performance of the model
+data_split <- initial_split(stroke_classification, prop = 0.75)
+
+#get the train and test datasets
+stroke_train <- training(data_split)
+stroke_test  <- testing(data_split)
+
+head(stroke_train)
+```
+
+## Preprocessing with recipes
+
+![](imgs/recipesBadge.png){fig-align="center"}
+
+```{r}
+library(recipes)
+
+#set the base recipe - use stroke as the outcome and the rest of the data as predictors
+stroke_rec <- 
+  recipe(stroke ~ ., data = stroke_train)
+
+stroke_rec
+```
+
+## Watch out for data leakage!
+
+This is a fundamental example of data leakage where the there is numeric patient ID column that is completely sufficient to distinguish between our outcome of interest. Often it is more subtle - see [@Whalen2022]
+
+```{r}
+library(cowplot)
+
+ggplot(stroke_train,aes(pat_id,stroke)) +
+  geom_jitter() +
+  theme_cowplot()
+
+```
+
+## Updating recipe to include an ID
+
+Having spotted the problem now we can specify that this column should be used only as an ID column. We could have just removed this column, but it is useful to keep track of individual observations in the modelling steps.
+
+```{r}
+stroke_rec <- stroke_rec %>%
+  update_role(pat_id, new_role = "ID")
+
+stroke_rec
+```
+
+## Encode gender as a dummy variable
+
+Many models require categorical variables such as be transformed into numeric dummy variables i.e `0` and `1`
+
+```{r}
+#Create dummy variables for the gender
+ stroke_rec <- stroke_rec%>%
+  step_dummy(gender)
+
+stroke_rec
+```
+
+## Can impute the missing BMI values
+
+We may have missing data in more or one of our predictors. This can be a big problem is fields such as proteomics, where the missingness may relate to the of interest outcome itself.
+
+```{r}
+
+stroke_rec <- stroke_rec %>%
+step_normalize(bmi,age,avg_glucose_level) %>%
+  step_impute_knn(bmi)
+
+```
+
+## What does the data look like when processed?
+
+Useful to check that the preprocessing isn't doing anything unexpected.
+
+```{r}
+
+stroke_rec %>% prep() %>% bake(NULL)
+
+```
+
+## Select a model with parsnip
+
+![](imgs/parsnipBadge.png){fig-align="center"}
+
+The choice of model depends on your application and type of data. Starting with a simple model is usually a good option to set a baseline for performance.
+
+```{r}
+show_engines("logistic_reg")
+
+```
+
+## Select a model with parsnip
+
+Here we'll choose glm as we have binary outcome data with a handful of predictors. Later we'll talk about what to do in genomics applications where we may have thousands of predictors.
+
+```{r}
+lm_mod <- logistic_reg() %>% set_engine("glm")
+lm_mod
+```
+
+## Make a workflow
+
+![](imgs/workflows.png){fig-align="center" width="200"}
+
+Workflows aim to make it easy to keep a track of the recipe used to preprocess data and the model used to fit the data.
+
+```{r}
+library(workflows)
+
+#add the model and the recipe to a workflow
+stroke_wflow <- 
+  workflow() %>% 
+  add_model(lm_mod) %>% 
+  add_recipe(stroke_rec)
+
+stroke_wflow
+```
+
+## Fit to the data
+
+Now we can finally run the workflow which preprocces the data and fits the model of the training data.
+
+```{r}
+stroke_fit <- 
+  stroke_wflow %>% 
+  fit(data = stroke_train)
+
+stroke_fit
+```
+
+## Extract the fit data
+
+![](imgs/broom.png){fig-align="center" width="200"}
+
+`extract_fit_parsnip` allows us to get the underlying fitted model from a workflow and `tidy` from the broom package gives us a nicely formatted tibble.
+
+Different models have different ways of interpreting the importance of the variables. Here we can look at the significance of the coefficients and see that age and avg_glucose_level are positively associated with a stroke in the training set.
+
+```{r}
+stroke_fit %>% 
+  extract_fit_parsnip() %>% 
+  tidy()
+```
+
+## Predict with the test set
+
+Now we have trained the model let's test the performance on the data we haven't used to fit on.
+
+`augment` adds the class probabilities as well as the hard class prediction.
+
+```{r}
+#get the predictions for the test set.
+stroke_aug <- 
+  augment(stroke_fit, stroke_test)
+
+head(stroke_aug)
+```
+
+## Let's look a the performance
+
+![](imgs/yardstick.png){fig-align="center"}
+
+The yardstick package has all lots of functions related to assessing how well a model is performing. To calculate the accuracy of the model of the test data we used the know outcome skroke or not `truth` and the predicted outcome of the model `estimate`.
+
+```{r}
+library(yardstick)
+
+
+#The accuracy is really high!
+accuracy(stroke_aug, truth=stroke,estimate=.pred_class)
+
+```
+
+It is useful to understand where the model is making mistakes. What does the confusion matrix look like?
+
+```{r}
+#ah!
+conf_mat(stroke_aug,stroke, .pred_class)
+```
+
+We've created a model which has predicted every patient hasn't had a stroke! This is likely to because the number of observed strokes in the dataset is very low so a model which simply predicts no one has had a stroke performs very well as judged by accuracy alone.
+
+::: callout-note
+Accuracy is a poor metric to use on datasets with class imbalance.
+:::
+
+## Look at the AUC
+
+Instead of using the class predictions we can instead use a metric ROC AUC that looks at the ranks of patient probabilities of having a stroke.
+
+```{r}
+two_class_curve <- roc_curve(stroke_aug, truth=stroke, .pred_0)
+autoplot(two_class_curve)
+
+
+```
+
+The ROC AUC is reasonable so the class boundaries need shifting (default 0.5) to better predict the stroke category of patients.
+
+```{r}
+roc_auc(stroke_aug,stroke, .pred_0)
+```
+
+## Try changing the class boundary threshold
+
+The probably package allows us to iterate through many thresholds of the class boundary and look at the trade off between sensitivity and specificity.
+
+```{r}
+#| message: false
+library(probably)
+
+threshold_data <- stroke_aug %>%
+  threshold_perf(stroke, .pred_0, thresholds = seq(0.7, 1, by = 0.01))
+```
+
+The J index is one way of choosing a threshold and is defined as `specificity + sensitivity -1` We can plot the data to see the relationship.
+
+```{r}
+max_j_index_threshold <- threshold_data %>%
+  filter(.metric == "j_index") %>%
+  filter(.estimate == max(.estimate)) %>%
+  pull(.threshold)
+
+ggplot(threshold_data, aes(x = .threshold, y = .estimate, color = .metric)) +
+  geom_line() +
+  geom_vline(xintercept = max_j_index_threshold, alpha = .6, color = "grey30") + theme_cowplot()
+```
+
+## Take homes
+
+-   Check your data, particularly if not your own
+
+-   Split into training and testing appropriately
+
+-   Watch out for data leakage and class imbalance
+
+-   Choose the appropriate metric for performance, thinking what the model will be used for.

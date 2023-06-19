@@ -1,0 +1,294 @@
+---
+title: "Introduction to machine learning with tidymodels"
+subtitle: Predicting the age of bats
+author: Dr Jamie Soul
+format: html
+editor: visual
+title-block-banner: true
+toc: true
+self-contained: true
+---
+
+![](imgs/CBF.png){fig-align="center"}
+
+## Let's look at a genomics example!
+
+Let's try to predict the age of bats from their skin DNA methylation data. The data is taken from:
+
+![](imgs/methylpaper.png){fig-align="center"}
+
+
+## Loading the metapackage
+
+```{r}
+library(tidymodels)
+```
+
+## Prepare the data
+
+The GEOquery library allows us to download the normalised methylation beta values from NCBI GEO.
+
+```{r}
+#| message: false
+library(GEOquery)
+library(tidyverse)
+library(skimr)
+
+#retrieve the dataset - note it always returns a list with one element per platform even if only one platform.
+geo <- getGEO( "GSE164127")[[1]]
+
+```
+
+Genomics datasets for machine learning tend to have many variables/features e.g CpGs, genes, proteins and relatively few observations.
+
+```{r}
+#have lots of cpgs
+dim(exprs(geo))
+```
+
+Beta values represent percentage of measured beads with that site methylated. Beta values are between 0 (completely unmethytlated ) and 1 (complely methylated). Note the data is pre-normalised for us. In best practice we'd pre-process the train and test data completely independently, i.e not normalised together at all.
+
+We can extract the table of samples and the beta values of every CpG.
+
+```{r}
+
+head(exprs(geo[,1:6]))
+```
+
+We can also extract the corresponding metadata. The metadata includes the age which we are trying to predict.
+
+```{r}
+skim(pData(geo))
+```
+
+Let's keep those samples which have a known age that we can use for modelling.
+
+```{r}
+geo$`age (years):ch1` <- as.numeric(geo$`age (years):ch1`)
+geo <- geo[ , geo$`canbeusedforagingstudies:ch1` =="yes" & geo$`tissue:ch1` == "Skin" & !is.na(geo$`age (years):ch1`)]
+```
+
+To make this faster to run and to show we can do ML on smaller datasets let's use just one of the bat species to train on.
+
+Let's train a model using data from: ![Greater spear-nosed bat](imgs/Phyllostomus_hastatus.jpg){fig-align="center"}
+
+To test how generalisable the model is we try to use the model across species to predict the age of:
+
+![Big brown bat](imgs/Big_brown_bat_crawl.png){fig-align="center" width="300"}
+
+```{r}
+
+#helper function to extract a data matrix for a particular bat species
+processData <- function(species,geo){
+  
+  geo_filtered <- geo[,geo$organism_ch1 == species]
+    
+  methyl_filtered  <- as.data.frame(t(exprs(geo_filtered)))
+  
+  methyl_filtered$age <- sqrt(as.numeric(geo_filtered$`age (years):ch1`)+1)
+  
+  return(methyl_filtered)
+}
+
+#Let's keep only 1k random CpGs to help training speed for this workshop
+set.seed(42)
+keep <- sample.int(nrow(geo),1000)
+geo <- geo[keep,]
+
+#get the data from model building and testing
+methyl_spearbat <- processData("Phyllostomus hastatus",geo)
+methyl_bigbrownbat <- processData("Eptesicus fuscus",geo)
+```
+
+## Create the training split
+
+Keeping 20% of the data for a final test. The remaining 80% will be used to train the parameters of the model.
+
+```{r}
+#Split the data into train and test
+methyl_spearbat_split <- initial_split(methyl_spearbat,prop = 0.8,strata=age)
+
+methyl_spearbat_train <- training(methyl_spearbat_split)
+methyl_spearbat_test <- testing(methyl_spearbat_split)
+```
+
+## Create the recipe
+
+Similar to before we define the outcome and scale-centre the rest of the predictors.
+
+```{r}
+#define the recipe
+methyl_recipe <- 
+  recipe(methyl_spearbat_train) %>%
+  update_role(everything()) %>%
+  update_role(age,new_role = "outcome")  %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+
+```
+
+## Select the model
+
+Let's use a GLMNet model which allows use to penalise the inclusion of variables to prevent overfitting and keep the model sparse. This is useful if we want to identify the minimal panel of biological features that are sufficient to get a good prediction e.g for a biomarker panel.
+
+mixture = 1 is known as a lasso model. In this model we need to tune the penalty (lambda) which controls the downweighting of variables (regulatisation).
+
+`tune` marks the penalty parameter as needing optimisation.
+
+```{r}
+#use glmnet model
+glmn_fit <- 
+  linear_reg( mixture = 1, penalty = tune()) %>% 
+  set_engine("glmnet") 
+
+```
+
+Let's cross validate within the training dataset to allow us to tune the parameters
+
+```{r}
+#5-fold cross validation
+folds <- vfold_cv(methyl_spearbat_train, v = 5, strata = age, breaks= 2)
+```
+
+## Create the workflow
+
+We build the workflow from the model and the recipe.
+
+```{r}
+#build the workflow
+methyl_wf <- workflow() %>%
+    add_model(glmn_fit) %>%
+    add_recipe(methyl_recipe)
+
+```
+
+## Define the tuning search space
+
+Here we'll check the performance of the model as we vary the penalty.
+
+```{r}
+#define a sensible search
+lasso_grid <- tibble(penalty = 10^seq(-3, 0, length.out = 50))
+```
+
+## Run the tuning workflow
+
+We can use multiple cpus to help speed up the tuning.
+
+```{r}
+#| message: false
+#Using 6 cores
+library(doParallel)
+cl <- makeCluster(6)
+registerDoParallel(cl)
+
+#tune the model
+methyl_res <- methyl_wf %>% 
+    tune_grid(resamples = folds,
+              grid = lasso_grid,
+              control = control_grid(save_pred = TRUE),
+              metrics = metric_set(rmse))
+methyl_res
+```
+
+## How does the regularisation affect the performance?
+
+We can find the best penalty value that minimises the error in our age prediction (rmse).
+
+```{r}
+autoplot(methyl_res)
+```
+
+## Finalise the model
+
+Get the best model parameters
+
+```{r}
+best_mod <- methyl_res %>% select_best("rmse")
+best_mod
+```
+
+Get the final model
+
+```{r}
+#fit on the training data using the best parameters
+final_fitted <- finalize_workflow(methyl_wf, best_mod) %>%
+    fit(data = methyl_spearbat_train)
+
+
+```
+
+## Test the performance
+
+Look at the performance in the test dataset. How well does the clock work on a different species?
+
+```{r}
+#get the test performance
+methyl_spearbat_aug <- augment(final_fitted, methyl_spearbat_test)
+rmse(methyl_spearbat_aug,truth = age, estimate = .pred)
+plot(methyl_spearbat_aug$.pred,methyl_spearbat_aug$age)
+
+#try on the different species
+methyl_bigbrownbat <- augment(final_fitted, methyl_bigbrownbat)
+plot(methyl_bigbrownbat$age,methyl_bigbrownbat$.pred)
+rmse(methyl_bigbrownbat,truth = age, estimate = .pred)
+
+```
+
+## What CpGs are important?
+
+We can use the coefficients from the model to determine what CpGs are driving the prediction. We can also see how many variables have been retained in the model using our tuned penalty value.
+
+```{r}
+#| message: false
+library(vip)
+library(cowplot)
+
+#get the importance from glmnet using the select penalty
+importance <- final_fitted %>%
+  extract_fit_parsnip() %>%
+  vi(lambda = best_mod$penalty) %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance)
+  )
+
+#how many CpGs are retained
+table(importance$Importance>0)
+
+```
+
+## Plot the importance of the top CpGs and their direction
+
+```{r}
+#plot the top 10 CpGs
+importance %>% slice_max(Importance,n=10) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL) + theme_cowplot()
+
+```
+
+## Plot the top predictive CpG beta values versus age
+
+This highlights how you can use machine learning to identify a small number of discrimative features.
+
+```{r}
+#helper function to plot a CpG beta values against age
+plotCpG <- function(cpg,dat){
+  
+  ggplot(dat,aes(x=!!sym(cpg),y=age)) +
+    geom_point() +
+    theme_cowplot()
+  
+}
+
+#plot the most important CpGs
+importance %>% 
+  slice_max(Importance,n=4) %>%
+  pull(Variable) %>% 
+  as.character() %>% 
+  map(plotCpG,methyl_spearbat) %>%
+  plot_grid(plotlist = .)
+```
